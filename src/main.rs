@@ -10,9 +10,9 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-const LOGICAL_WIDTH: u32 = 500; // High performance!
+const LOGICAL_WIDTH: u32 = 500;
 const LOGICAL_HEIGHT: u32 = 400;
-const WIDTH: u32 = 2000; // Big window!
+const WIDTH: u32 = 2000;
 const HEIGHT: u32 = 1600;
 const FPS: u64 = 60;
 const FRAME_DURATION: Duration = Duration::from_micros(1_000_000 / FPS);
@@ -25,7 +25,7 @@ struct Input {
 struct Camera {
     center_re: f64,
     center_im: f64,
-    zoom: f64, // Higher = more zoomed in
+    zoom: f64,
 }
 
 impl Camera {
@@ -38,33 +38,49 @@ impl Camera {
 
         (re, im)
     }
+
+    fn current_depth(&self) -> u32 {
+        let base_depth = 100.0;
+        let sensitivity = 40.0;
+        (base_depth + sensitivity * self.zoom.sqrt()) as u32
+    }
 }
 
 struct Mandelbrot {
     window: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
     last_frame: Instant,
+    last_input_time: Instant,
     camera: Camera,
     input: Input,
+    lwidth: u32,
+    lheight: u32,
 }
 
 impl Mandelbrot {
-    fn is_in_set(c_re: f32, c_im: f32, max_depth: u32) -> u8 {
-        let mut z_re = 0.0;
-        let mut z_im = 0.0;
+    fn get_color(i: u32, z_re: f32, z_im: f32) -> [u8; 4] {
+        let mag_sq = z_re * z_re + z_im * z_im;
+        let smooth_i = i as f32 + 1.0 - (mag_sq.ln() / 2.0).ln() / 2.0f32.ln();
 
-        for i in 0..max_depth {
-            let re_sq = z_re * z_re;
-            let im_sq = z_im * z_im;
+        let t = 0.05 * smooth_i;
 
-            if re_sq + im_sq > 4.0 {
-                return ((i as f32 / max_depth as f32) * 255.0) as u8;
+        let r = (u8::MAX as f32 * (t * 0.5).sin().abs()) as u8;
+        let g = (u8::MAX as f32 * (t * 0.2).sin().powi(2)) as u8;
+        let b = (u8::MAX as f32 * (t * 0.1).sin().powi(4)) as u8;
+
+        [r, g, b, 255]
+    }
+
+    fn set_resolution(&mut self, factor: u32) {
+        let new_w = LOGICAL_WIDTH / factor;
+        let new_h = LOGICAL_HEIGHT / factor;
+        if self.lwidth != new_w {
+            self.lwidth = new_w;
+            self.lheight = new_h;
+            if let Some(pixels) = &mut self.pixels {
+                let _ = pixels.resize_buffer(new_w, new_h);
             }
-            z_im = 2.0 * z_re * z_im + c_im;
-            z_re = re_sq - im_sq + c_re;
         }
-
-        255
     }
 }
 
@@ -74,6 +90,7 @@ impl Default for Mandelbrot {
             window: None,
             pixels: None,
             last_frame: Instant::now(),
+            last_input_time: Instant::now(),
             camera: Camera {
                 center_re: 0.0,
                 center_im: 0.0,
@@ -83,6 +100,8 @@ impl Default for Mandelbrot {
                 last_mouse_pos: (0.0, 0.0),
                 is_clicked: false,
             },
+            lwidth: LOGICAL_WIDTH,
+            lheight: LOGICAL_HEIGHT,
         }
     }
 }
@@ -90,16 +109,12 @@ impl Default for Mandelbrot {
 impl ApplicationHandler for Mandelbrot {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let win_attr = WindowAttributes::default()
-            .with_title("Mandelbrot")
+            .with_title("Mandelbrot Explorer")
             .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
 
         let win: &'static Window = Box::leak(Box::new(event_loop.create_window(win_attr).unwrap()));
-
-        // The first two arguments are the width/height of the PIXEL BUFFER
-        let surface_texture = SurfaceTexture::new(LOGICAL_WIDTH, LOGICAL_HEIGHT, win);
-
-        // Pixels will now take our small buffer and upscale it to the window
-        let pixels = Pixels::new(LOGICAL_WIDTH, LOGICAL_HEIGHT, surface_texture).unwrap();
+        let surface_texture = SurfaceTexture::new(self.lwidth, self.lheight, win);
+        let pixels = Pixels::new(self.lwidth, self.lheight, surface_texture).unwrap();
 
         self.window = Some(win);
         self.pixels = Some(pixels);
@@ -109,16 +124,14 @@ impl ApplicationHandler for Mandelbrot {
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
         _window_id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
+        event: WindowEvent,
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state.is_pressed() {
                     match event.physical_key {
-                        winit::keyboard::PhysicalKey::Code(KeyCode::Escape) => {
-                            event_loop.exit();
-                        }
+                        winit::keyboard::PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                         _ => {}
                     }
                 }
@@ -127,61 +140,79 @@ impl ApplicationHandler for Mandelbrot {
                 self.input.is_clicked = state.is_pressed();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll_amount = match delta {
+                let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
 
-                if scroll_amount > 0.0 {
+                if scroll > 0.0 {
                     self.camera.zoom *= 1.1;
                 } else {
                     self.camera.zoom /= 1.1;
                 }
 
+                self.last_input_time = Instant::now();
+                self.set_resolution(2);
                 if let Some(window) = self.window {
                     window.request_redraw();
                 }
             }
-
             WindowEvent::CursorMoved { position, .. } => {
                 let d_x = position.x - self.input.last_mouse_pos.0;
                 let d_y = position.y - self.input.last_mouse_pos.1;
 
                 if self.input.is_clicked {
-                    let aspect_ratio = WIDTH as f64 / HEIGHT as f64;
                     let range = 4.0 / self.camera.zoom;
-
-                    self.camera.center_re -= (d_x / WIDTH as f64) * range * aspect_ratio;
+                    let aspect = WIDTH as f64 / HEIGHT as f64;
+                    self.camera.center_re -= (d_x / WIDTH as f64) * range * aspect;
                     self.camera.center_im -= (d_y / HEIGHT as f64) * range;
 
-                    if let Some(window) = self.window {
-                        window.request_redraw();
-                    }
+                    self.last_input_time = Instant::now();
+                    self.set_resolution(2);
                 }
-                self.input.last_mouse_pos = (position.x, position.y);
-            }
 
+                self.input.last_mouse_pos = (position.x, position.y);
+                if let Some(window) = self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(pixels) = &mut self.pixels {
                     let frame = pixels.frame_mut();
-                    frame.fill(0);
+                    let lw = self.lwidth;
+                    let lh = self.lheight;
+
+                    // This is the value that must increase as you zoom
+                    let dynamic_depth = self.camera.current_depth();
+
                     frame
                         .par_chunks_exact_mut(4)
                         .enumerate()
                         .for_each(|(i, pixel)| {
-                            let x = (i as u32) % LOGICAL_WIDTH;
-                            let y = (i as u32) / LOGICAL_WIDTH;
+                            let x = (i as u32) % lw;
+                            let y = (i as u32) / lw;
+                            let (c_re, c_im) = self.camera.map(x, y, lw, lh);
 
-                            let (re, im) = self.camera.map(x, y, LOGICAL_WIDTH, LOGICAL_HEIGHT);
-                            let val = Mandelbrot::is_in_set(re as f32, im as f32, 100);
+                            let mut z_re = 0.0;
+                            let mut z_im = 0.0;
+                            let mut color = [0, 0, 0, 255];
 
-                            pixel[0] = val;
-                            pixel[1] = val;
-                            pixel[2] = val;
-                            pixel[3] = 255;
+                            for iteration in 0..dynamic_depth {
+                                let re_sq = z_re * z_re;
+                                let im_sq = z_im * z_im;
+
+                                if re_sq + im_sq > 4.0 {
+                                    color = Self::get_color(iteration, z_re, z_im);
+                                    break;
+                                }
+                                z_im = 2.0 * z_re * z_im + c_im as f32;
+                                z_re = re_sq - im_sq + c_re as f32;
+                            }
+                            pixel.copy_from_slice(&color);
                         });
+
                     if let Err(err) = pixels.render() {
-                        eprintln!("pixels.render() failed: {err}");
+                        eprintln!("Render error: {err}");
                         event_loop.exit();
                     }
                 }
@@ -189,9 +220,22 @@ impl ApplicationHandler for Mandelbrot {
             _ => {}
         }
     }
+
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         let now = Instant::now();
+
+        // Snap back to high-res after 100ms of inactivity
+        if now.duration_since(self.last_input_time) > Duration::from_millis(100) {
+            if self.lwidth != LOGICAL_WIDTH {
+                self.set_resolution(1);
+                if let Some(window) = self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+
         if now - self.last_frame >= FRAME_DURATION {
+            self.last_frame = now;
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -199,7 +243,7 @@ impl ApplicationHandler for Mandelbrot {
     }
 }
 
-fn main(){
+fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let mut app = Mandelbrot::default();
