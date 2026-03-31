@@ -10,13 +10,14 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-const ASPECT_RATIO: f32 = 1.0 / 1.0;
+const ASPECT_RATIO: f64 = 1.0 / 1.0;
 const LOGICAL_WIDTH: u32 = 500;
-const LOGICAL_HEIGHT: u32 = (LOGICAL_WIDTH as f32 * ASPECT_RATIO) as u32;
+const LOGICAL_HEIGHT: u32 = (LOGICAL_WIDTH as f64 * ASPECT_RATIO) as u32;
 const WIDTH: u32 = 1600;
-const HEIGHT: u32 = (WIDTH as f32 * ASPECT_RATIO) as u32;
+const HEIGHT: u32 = (WIDTH as f64 * ASPECT_RATIO) as u32;
 const FPS: u64 = 60;
 const FRAME_DURATION: Duration = Duration::from_micros(1_000_000 / FPS);
+const LN2_INV: f64 = 1.0 / std::f64::consts::LN_2;
 
 struct Input {
     last_mouse_pos: (f64, f64),
@@ -41,9 +42,7 @@ impl Camera {
     }
 
     fn current_depth(&self) -> u32 {
-        let base_depth = 150.0;
-        let sensitivity = 40.0;
-        (base_depth + sensitivity * self.zoom.sqrt()) as u32
+        (100.0 * self.zoom.log2().max(1.0)) as u32
     }
 }
 
@@ -56,18 +55,20 @@ struct Mandelbrot {
     input: Input,
     lwidth: u32,
     lheight: u32,
+    width: u32,
+    height: u32,
 }
 
 impl Mandelbrot {
-    fn get_color(i: u32, z_re: f32, z_im: f32) -> [u8; 4] {
+    fn get_color(i: u32, z_re: f64, z_im: f64) -> [u8; 4] {
         let mag_sq = z_re * z_re + z_im * z_im;
-        let smooth_i = i as f32 + 1.0 - (mag_sq.ln() / 2.0).ln() / 2.0f32.ln();
+        let smooth_i = i as f64 + 1.0 - (mag_sq.ln() * 0.5).ln() * LN2_INV;
 
         let t = 0.05 * smooth_i;
 
-        let r = (u8::MAX as f32 * (t * 0.5).sin().abs()) as u8;
-        let g = (u8::MAX as f32 * (t * 0.2).sin().powi(2)) as u8;
-        let b = (u8::MAX as f32 * (t * 0.4).sin().powi(4)) as u8;
+        let r = (u8::MAX as f64 * (t * 0.3).sin().abs()) as u8;
+        let g = (u8::MAX as f64 * (t * 0.2).sin().powi(2)) as u8;
+        let b = (u8::MAX as f64 * (t * 0.7).sin().powi(4)) as u8;
 
         [r, g, b, 255]
     }
@@ -107,6 +108,8 @@ impl Default for Mandelbrot {
             },
             lwidth: LOGICAL_WIDTH,
             lheight: LOGICAL_HEIGHT,
+            width: WIDTH,
+            height: HEIGHT,
         }
     }
 }
@@ -115,7 +118,7 @@ impl ApplicationHandler for Mandelbrot {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let win_attr = WindowAttributes::default()
             .with_title("Mandelbrot Explorer")
-            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
+            .with_inner_size(PhysicalSize::new(self.width, self.height));
 
         let win: &'static Window = Box::leak(Box::new(event_loop.create_window(win_attr).unwrap()));
         let surface_texture = SurfaceTexture::new(self.lwidth, self.lheight, win);
@@ -146,15 +149,25 @@ impl ApplicationHandler for Mandelbrot {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y,
                 };
+
+                let (mx, my) = self.input.last_mouse_pos;
+                let (mouse_re, mouse_im) =
+                    self.camera
+                        .map(mx as u32, my as u32, self.width, self.height);
 
                 if scroll > 0.0 {
                     self.camera.zoom *= 1.1;
                 } else {
                     self.camera.zoom /= 1.1;
                 }
+                let (new_re, new_im) =
+                    self.camera
+                        .map(mx as u32, my as u32, self.width, self.height);
+                self.camera.center_re += mouse_re - new_re;
+                self.camera.center_im += mouse_im - new_im;
 
                 self.last_input_time = Instant::now();
                 self.set_resolution(2);
@@ -168,9 +181,9 @@ impl ApplicationHandler for Mandelbrot {
 
                 if self.input.is_clicked {
                     let range = 4.0 / self.camera.zoom;
-                    let aspect = WIDTH as f64 / HEIGHT as f64;
-                    self.camera.center_re -= (d_x / WIDTH as f64) * range * aspect;
-                    self.camera.center_im -= (d_y / HEIGHT as f64) * range;
+                    let aspect = self.width as f64 / self.height as f64;
+                    self.camera.center_re -= (d_x / self.width as f64) * range * aspect;
+                    self.camera.center_im -= (d_y / self.height as f64) * range;
 
                     self.last_input_time = Instant::now();
                     self.set_resolution(2);
@@ -186,8 +199,6 @@ impl ApplicationHandler for Mandelbrot {
                     let frame = pixels.frame_mut();
                     let lw = self.lwidth;
                     let lh = self.lheight;
-
-                    // This is the value that must increase as you zoom
                     let dynamic_depth = self.camera.current_depth();
 
                     frame
@@ -210,8 +221,8 @@ impl ApplicationHandler for Mandelbrot {
                                     color = Self::get_color(iteration, z_re, z_im);
                                     break;
                                 }
-                                z_im = 2.0 * z_re * z_im + c_im as f32;
-                                z_re = re_sq - im_sq + c_re as f32;
+                                z_im = 2.0 * z_re * z_im + c_im;
+                                z_re = re_sq - im_sq + c_re;
                             }
                             pixel.copy_from_slice(&color);
                         });
@@ -223,13 +234,13 @@ impl ApplicationHandler for Mandelbrot {
                 }
             }
             WindowEvent::Resized(PhysicalSize { width, height }) => {
-                self.lwidth = width / 4;
-                self.lheight = height / 4;
+                self.width = width;
+                self.height = height;
+                self.lwidth = width / 2;
+                self.lheight = height / 2;
                 if let (Some(pixels), Some(window)) = (&mut self.pixels, &self.window) {
                     let _ = pixels.resize_buffer(self.lwidth, self.lheight);
-
                     let _ = pixels.resize_surface(width, height);
-
                     window.request_redraw();
                 }
             }
